@@ -7,6 +7,7 @@ import os
 
 XLSX_FILE = "DC1_DC2 Ranges.xlsx"
 MAX_PORT = 65535
+PORT_TIMEOUT = 2
 RANGE_PATTERN = re.compile(
     r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}-\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$"
 )
@@ -35,17 +36,28 @@ def ip_range_iter(range_str: str):
         yield str(ipaddress.IPv4Address(ip_int))
 
 
-def scan_ip(ip_address: str, max_port: int = MAX_PORT):
+def scan_ip(ip_address: str, max_port: int = MAX_PORT, timeout: int = PORT_TIMEOUT):
     for port in range(1, max_port + 1):
+        print(f"\r    probing port {port}/{max_port} ...", end="", flush=True)
+
         proc = subprocess.Popen(
             [f'bash -c "/bin/echo \'\' > /dev/tcp/{ip_address}/{port} 2>&/dev/null"'],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             shell=True,
         )
-        (out, err) = proc.communicate()
+        try:
+            (out, err) = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            continue
+
         if b"ambiguous redirect" in out:
+            print()
             return port
+
+    print()
     return None
 
 
