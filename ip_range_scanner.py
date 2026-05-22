@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import subprocess
+import socket
 import ipaddress
 import pandas as pd
 import re
@@ -7,7 +7,7 @@ import os
 
 XLSX_FILE = "DC1_DC2 Ranges.xlsx"
 MAX_PORT = 65535
-PORT_TIMEOUT = 2
+PORT_TIMEOUT = 0.5        # seconds to wait per port connect attempt
 RANGE_PATTERN = re.compile(
     r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}-\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$"
 )
@@ -36,26 +36,18 @@ def ip_range_iter(range_str: str):
         yield str(ipaddress.IPv4Address(ip_int))
 
 
-def scan_ip(ip_address: str, max_port: int = MAX_PORT, timeout: int = PORT_TIMEOUT):
+def scan_ip(ip_address: str, max_port: int = MAX_PORT, timeout: float = PORT_TIMEOUT):
     for port in range(1, max_port + 1):
         print(f"\r    probing port {port}/{max_port} ...", end="", flush=True)
-
-        proc = subprocess.Popen(
-            [f'bash -c "/bin/echo \'\' > /dev/tcp/{ip_address}/{port} 2>&/dev/null"'],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            shell=True,
-        )
         try:
-            (out, err) = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.communicate()
-            continue
-
-        if b"ambiguous redirect" in out:
-            print()
-            return port
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(timeout)
+                result = s.connect_ex((ip_address, port))
+                if result == 0:      # 0 = connection succeeded → port open
+                    print()
+                    return port
+        except (socket.error, OverflowError):
+            pass                     # unreachable / bad port, keep going
 
     print()
     return None
@@ -74,14 +66,14 @@ def scan_range(range_str: str):
 
     for ip in ip_range_iter(range_str):
         scanned += 1
-        print(f"  [{scanned}/{total_ips}] Scanning {ip} ...", end=" ", flush=True)
+        print(f"  [{scanned}/{total_ips}] Scanning {ip} ...", flush=True)
         open_port = scan_ip(ip)
         if open_port is not None:
             reachable[ip] = open_port
-            print(f"REACHABLE (port {open_port})")
+            print(f"  -> REACHABLE (port {open_port})")
         else:
             unreachable.append(ip)
-            print("unreachable")
+            print(f"  -> unreachable")
 
     return reachable, unreachable
 
