@@ -1,24 +1,33 @@
 #!/usr/bin/env python3
+"""
+IP Range Scanner — Grafana/SNOW ingest edition
+Prompts for a start/end IP, splits the range across threads,
+scans all 65535 ports per IP with nmap, records ALL open ports,
+and writes a single structured .json file ready for ingestion.
+
+Requirements:
+    pip install python-nmap
+    nmap must be installed: sudo apt install nmap  /  brew install nmap
+    Recommended: run as root for SYN scan accuracy
+"""
 
 import nmap
 import ipaddress
-import pandas as pd
 import re
 import os
 import json
 import threading
 import signal
 import sys
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
+from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Configuration
+# ─── Configuration ────────────────────────────────────────────────────────────
 
-XLSX_FILE        = "DC1_DC2 Ranges.xlsx"
-MAX_PORT         = 65535
-MAX_THREADS      = 3
-PER_IP_TIMEOUT   = 120
-NMAP_ARGS        = (
+MAX_THREADS    = 4       # threads working the SAME range in parallel IP chunks
+MAX_PORT       = 65535
+PER_IP_TIMEOUT = 120     # seconds before nmap is force-abandoned on a single IP
+NMAP_ARGS = (
     "-T4 "
     "--open "
     "-n "
@@ -28,184 +37,219 @@ NMAP_ARGS        = (
     "--defeat-rst-ratelimit"
 )
 
-RANGE_PATTERN = re.compile(
-    r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}"
-    r"-\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$"
-)
+# ─── Thread-safe print ────────────────────────────────────────────────────────
 
-# Helpers
-
-def is_valid_range(value: str) -> bool:
-    if not isinstance(value, str):
-        return False
-    value = value.strip()
-    if not RANGE_PATTERN.match(value):
-        return False
-    try:
-        start_str, end_str = value.split("-")
-        return int(ipaddress.IPv4Address(start_str.strip())) <= \
-               int(ipaddress.IPv4Address(end_str.strip()))
-    except Exception:
-        return False
-
-
-def ip_range_iter(range_str: str):
-    start_str, end_str = range_str.strip().split("-")
-    start = int(ipaddress.IPv4Address(start_str.strip()))
-    end   = int(ipaddress.IPv4Address(end_str.strip()))
-    for ip_int in range(start, end + 1):
-        yield str(ipaddress.IPv4Address(ip_int))
-
-
-def safe_filename(range_str: str) -> str:
-    return range_str.replace("/", "_").replace(":", "_").replace(" ", "_") + ".json"
-
-
-# Thread-safe print lock so lines from different threads don't interleave
 _print_lock = threading.Lock()
 
-def tprint(thread_label: str, msg: str):
+def tprint(thread_id: int, msg: str):
     with _print_lock:
-        print(f"[{thread_label}] {msg}", flush=True)
+        print(f"[Thread-{thread_id}] {msg}", flush=True)
+
+# ─── Input helpers ────────────────────────────────────────────────────────────
+
+def prompt_ip(label: str) -> ipaddress.IPv4Address:
+    while True:
+        raw = input(f"  {label}: ").strip()
+        try:
+            return ipaddress.IPv4Address(raw)
+        except ipaddress.AddressValueError:
+            print(f"  [!] '{raw}' is not a valid IPv4 address. Try again.")
 
 
-def scan_ip_nmap(nm: nmap.PortScanner, ip: str, thread_label: str) -> int | None:
-    port_range = f"1-{MAX_PORT}"
-    tprint(thread_label, f"  probing {ip} ports {port_range} ...")
+def get_range() -> tuple[ipaddress.IPv4Address, ipaddress.IPv4Address]:
+    print("\nEnter the IP range to scan:")
+    while True:
+        start = prompt_ip("Start IP")
+        end   = prompt_ip("End IP  ")
+        if int(start) > int(end):
+            print("  [!] Start IP must be <= End IP. Try again.\n")
+        else:
+            return start, end
 
-    result_holder = [None]
-    error_holder  = [None]
+
+def split_range(start: ipaddress.IPv4Address,
+                end:   ipaddress.IPv4Address,
+                n:     int) -> list[list[str]]:
+    """Split [start, end] into n roughly equal chunks of IP strings."""
+    total  = int(end) - int(start) + 1
+    size   = max(1, total // n)
+    chunks = []
+    cur    = int(start)
+    end_i  = int(end)
+    for i in range(n):
+        chunk_start = cur
+        chunk_end   = cur + size - 1 if i < n - 1 else end_i
+        chunk_end   = min(chunk_end, end_i)
+        chunks.append([str(ipaddress.IPv4Address(ip))
+                        for ip in range(chunk_start, chunk_end + 1)])
+        cur = chunk_end + 1
+        if cur > end_i:
+            break
+    return [c for c in chunks if c]  # drop empty chunks
+
+# ─── Per-IP scan ──────────────────────────────────────────────────────────────
+
+def scan_ip_nmap(nm: nmap.PortScanner,
+                 ip: str,
+                 thread_id: int) -> list[int] | None:
+    """
+    Scan all 65535 ports on one IP.
+    Returns a sorted list of ALL open ports, or None if unreachable/timeout.
+    """
+    tprint(thread_id, f"scanning {ip} ...")
+
+    error_holder = [None]
+    done_event   = threading.Event()
 
     def do_scan():
         try:
-            nm.scan(hosts=ip, ports=port_range, arguments=NMAP_ARGS)
+            nm.scan(hosts=ip, ports=f"1-{MAX_PORT}", arguments=NMAP_ARGS)
         except Exception as e:
             error_holder[0] = e
+        finally:
+            done_event.set()
 
-    scan_thread = threading.Thread(target=do_scan, daemon=True)
-    scan_thread.start()
-    scan_thread.join(timeout=PER_IP_TIMEOUT)
+    t = threading.Thread(target=do_scan, daemon=True)
+    t.start()
+    triggered = done_event.wait(timeout=PER_IP_TIMEOUT)
 
-    if scan_thread.is_alive():
-        tprint(thread_label, f"  !! TIMEOUT on {ip} after {PER_IP_TIMEOUT}s — skipping")
-        # We can't kill the thread directly, but daemon=True means it won't
-        # block program exit. Return None and move on.
+    if not triggered:
+        tprint(thread_id, f"  !! TIMEOUT ({PER_IP_TIMEOUT}s) on {ip} — skipping")
         return None
 
     if error_holder[0]:
-        tprint(thread_label, f"  !! nmap error on {ip}: {error_holder[0]}")
+        tprint(thread_id, f"  !! nmap error on {ip}: {error_holder[0]}")
         return None
 
     if ip not in nm.all_hosts():
+        tprint(thread_id, f"  -> unreachable")
         return None
 
-    open_ports = [
+    open_ports = sorted([
         port
         for proto in nm[ip].all_protocols()
         for port, state in nm[ip][proto].items()
         if state["state"] == "open"
-    ]
+    ])
 
-    return min(open_ports) if open_ports else None
+    if open_ports:
+        tprint(thread_id, f"  -> REACHABLE — open ports: {open_ports}")
+        return open_ports
 
+    tprint(thread_id, f"  -> host up but no open ports found")
+    return None
 
-def scan_range(range_str: str) -> dict:
-    """Scan every IP in the range. Returns a result dict."""
-    label = range_str          # used as thread label in log lines
-    nm    = nmap.PortScanner() # each thread gets its own scanner instance
+# ─── Worker: scan a chunk of IPs ──────────────────────────────────────────────
 
-    all_ips   = list(ip_range_iter(range_str))
-    total     = len(all_ips)
-    reachable   = {}
-    unreachable = []
+def scan_chunk(chunk: list[str], thread_id: int) -> list[dict]:
+    """Scan every IP in chunk, return list of reachable host records."""
+    nm      = nmap.PortScanner()
+    results = []
+    total   = len(chunk)
 
-    tprint(label, f"Starting — {total} IPs to scan")
-
-    for idx, ip in enumerate(all_ips, 1):
-        tprint(label, f"[{idx}/{total}] scanning {ip}")
+    for idx, ip in enumerate(chunk, 1):
+        tprint(thread_id, f"[{idx}/{total}] {ip}")
         try:
-            open_port = scan_ip_nmap(nm, ip, label)
+            open_ports = scan_ip_nmap(nm, ip, thread_id)
         except Exception as e:
-            tprint(label, f"  !! unexpected error on {ip}: {e} — skipping")
-            unreachable.append(ip)
+            tprint(thread_id, f"  !! unexpected error on {ip}: {e}")
             continue
 
-        if open_port is not None:
-            reachable[ip] = open_port
-            tprint(label, f"  -> REACHABLE  port {open_port}")
-        else:
-            unreachable.append(ip)
-            tprint(label, f"  -> unreachable")
+        if open_ports:
+            results.append({
+                "ip":         ip,
+                "open_ports": open_ports,
+                "port_count": len(open_ports),
+            })
 
-    result = {
-        "range":             range_str,
-        "scanned_at":        datetime.utcnow().isoformat() + "Z",
-        "total_ips":         total,
-        "total_reachable":   len(reachable),
-        "total_unreachable": len(unreachable),
-        "reachable": [
-            {"ip": ip, "first_open_port": port}
-            for ip, port in reachable.items()
-        ],
-        "unreachable": unreachable,
+    return results
+
+# ─── Output ───────────────────────────────────────────────────────────────────
+
+def build_output(start: ipaddress.IPv4Address,
+                 end:   ipaddress.IPv4Address,
+                 hosts: list[dict],
+                 scan_start: datetime,
+                 scan_end:   datetime) -> dict:
+    """Build the JSON document structured for Grafana/SNOW ingestion."""
+    total_ips = int(end) - int(start) + 1
+    return {
+        "meta": {
+            "schema_version":  "1.0",
+            "scan_start":      scan_start.isoformat(),
+            "scan_end":        scan_end.isoformat(),
+            "duration_seconds": (scan_end - scan_start).total_seconds(),
+            "range_start":     str(start),
+            "range_end":       str(end),
+            "total_ips_scanned":  total_ips,
+            "total_reachable":    len(hosts),
+            "total_unreachable":  total_ips - len(hosts),
+            "threads_used":    MAX_THREADS,
+            "max_port":        MAX_PORT,
+        },
+        "hosts": sorted(hosts, key=lambda h: ipaddress.IPv4Address(h["ip"]))
     }
 
-    filename = safe_filename(range_str)
-    with open(filename, "w") as f:
-        json.dump(result, f, indent=2)
 
-    tprint(label, f"Done — saved to {filename} "
-                  f"({len(reachable)} reachable / {len(unreachable)} unreachable)")
-    return result
+def save_json(data: dict, start: ipaddress.IPv4Address) -> str:
+    ts       = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    filename = f"scan_{start}_{ts}.json"
+    with open(filename, "w") as f:
+        json.dump(data, f, indent=2)
+    return filename
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    # Graceful Ctrl-C
     signal.signal(signal.SIGINT, lambda *_: (print("\n[!] Interrupted."), sys.exit(1)))
 
-    if not os.path.isfile(XLSX_FILE):
-        print(f"[ERROR] File not found: {XLSX_FILE}")
+    print("=" * 60)
+    print("  IP Range Scanner — Grafana/SNOW Edition")
+    print("=" * 60)
+
+    start, end = get_range()
+    total_ips  = int(end) - int(start) + 1
+
+    print(f"\nRange  : {start}  ->  {end}")
+    print(f"IPs    : {total_ips:,}")
+    print(f"Threads: {MAX_THREADS}")
+    print(f"Ports  : 1-{MAX_PORT}")
+    confirm = input("\nStart scan? [y/N]: ").strip().lower()
+    if confirm != "y":
+        print("Aborted.")
         return
 
-    try:
-        df = pd.read_excel(XLSX_FILE, header=None, dtype=str)
-    except Exception as e:
-        print(f"[ERROR] Could not read Excel file: {e}")
-        return
+    chunks    = split_range(start, end, MAX_THREADS)
+    all_hosts = []
+    results_lock = threading.Lock()
+    scan_start   = datetime.now(timezone.utc)
 
-    ranges  = []
-    skipped = 0
-    for idx, value in df.iloc[:, 0].items():
-        cell = str(value).strip() if pd.notna(value) else ""
-        if is_valid_range(cell):
-            ranges.append(cell)
-        else:
-            if cell and cell.lower() != "nan":
-                print(f"[SKIP] Row {idx + 1}: '{cell}' is not a valid IP range.")
-            skipped += 1
+    print(f"\nScan started at {scan_start.isoformat()}\n")
 
-    print(f"\nFound {len(ranges)} valid range(s). "
-          f"Skipped {skipped} non-range row(s). "
-          f"Running up to {MAX_THREADS} ranges in parallel.\n")
-
-    if not ranges:
-        print("No valid ranges to scan. Exiting.")
-        return
-
-    # Each future maps to its range string for error reporting
-    futures_map = {}
     with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        for range_str in ranges:
-            future = executor.submit(scan_range, range_str)
-            futures_map[future] = range_str
-
-        for future in as_completed(futures_map):
-            range_str = futures_map[future]
+        futures = {
+            executor.submit(scan_chunk, chunk, tid): tid
+            for tid, chunk in enumerate(chunks, 1)
+        }
+        for future in as_completed(futures):
+            tid = futures[future]
             try:
-                future.result(timeout=None)   # result already saved inside scan_range
+                chunk_results = future.result()
+                with results_lock:
+                    all_hosts.extend(chunk_results)
             except Exception as e:
-                print(f"[ERROR] Range '{range_str}' failed: {e}")
+                print(f"[ERROR] Thread-{tid} failed: {e}")
 
-    print("\nAll ranges processed.")
+    scan_end = datetime.now(timezone.utc)
+    output   = build_output(start, end, all_hosts, scan_start, scan_end)
+    filename = save_json(output, start)
+
+    print("\n" + "=" * 60)
+    print(f"Scan complete.")
+    print(f"  Duration  : {output['meta']['duration_seconds']:.1f}s")
+    print(f"  Reachable : {output['meta']['total_reachable']}")
+    print(f"  Output    : {filename}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
