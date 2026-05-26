@@ -1,16 +1,4 @@
 #!/usr/bin/env python3
-"""
-IP Range Scanner — Grafana/SNOW ingest edition
-Prompts for a start/end IP, splits the range across threads,
-scans all 65535 ports per IP with nmap, records ALL open ports,
-and writes a single structured .json file ready for ingestion.
-
-Requirements:
-    pip install python-nmap
-    nmap must be installed: sudo apt install nmap  /  brew install nmap
-    Recommended: run as root for SYN scan accuracy
-"""
-
 import nmap
 import ipaddress
 import re
@@ -22,12 +10,13 @@ import sys
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ─── Configuration ────────────────────────────────────────────────────────────
+# Configuration
 
-MAX_THREADS    = 4       # threads working the SAME range in parallel IP chunks
+MAX_THREADS    = 4
 MAX_PORT       = 65535
-PER_IP_TIMEOUT = 120     # seconds before nmap is force-abandoned on a single IP
+PER_IP_TIMEOUT = 120
 NMAP_ARGS = (
+    "-Pn "
     "-T4 "
     "--open "
     "-n "
@@ -37,7 +26,7 @@ NMAP_ARGS = (
     "--defeat-rst-ratelimit"
 )
 
-# ─── Thread-safe print ────────────────────────────────────────────────────────
+# Thread-safe print
 
 _print_lock = threading.Lock()
 
@@ -45,7 +34,7 @@ def tprint(thread_id: int, msg: str):
     with _print_lock:
         print(f"[Thread-{thread_id}] {msg}", flush=True)
 
-# ─── Input helpers ────────────────────────────────────────────────────────────
+# Input helpers
 
 def prompt_ip(label: str) -> ipaddress.IPv4Address:
     while True:
@@ -70,7 +59,6 @@ def get_range() -> tuple[ipaddress.IPv4Address, ipaddress.IPv4Address]:
 def split_range(start: ipaddress.IPv4Address,
                 end:   ipaddress.IPv4Address,
                 n:     int) -> list[list[str]]:
-    """Split [start, end] into n roughly equal chunks of IP strings."""
     total  = int(end) - int(start) + 1
     size   = max(1, total // n)
     chunks = []
@@ -87,15 +75,12 @@ def split_range(start: ipaddress.IPv4Address,
             break
     return [c for c in chunks if c]  # drop empty chunks
 
-# ─── Per-IP scan ──────────────────────────────────────────────────────────────
+# Per-IP scan
 
 def scan_ip_nmap(nm: nmap.PortScanner,
                  ip: str,
                  thread_id: int) -> list[int] | None:
-    """
-    Scan all 65535 ports on one IP.
-    Returns a sorted list of ALL open ports, or None if unreachable/timeout.
-    """
+
     tprint(thread_id, f"scanning {ip} ...")
 
     error_holder = [None]
@@ -139,7 +124,7 @@ def scan_ip_nmap(nm: nmap.PortScanner,
     tprint(thread_id, f"  -> host up but no open ports found")
     return None
 
-# ─── Worker: scan a chunk of IPs ──────────────────────────────────────────────
+# Worker: scan a chunk of IPs
 
 def scan_chunk(chunk: list[str], thread_id: int) -> list[dict]:
     """Scan every IP in chunk, return list of reachable host records."""
@@ -164,7 +149,7 @@ def scan_chunk(chunk: list[str], thread_id: int) -> list[dict]:
 
     return results
 
-# ─── Output ───────────────────────────────────────────────────────────────────
+# Output
 
 def build_output(start: ipaddress.IPv4Address,
                  end:   ipaddress.IPv4Address,
@@ -198,7 +183,6 @@ def save_json(data: dict, start: ipaddress.IPv4Address) -> str:
         json.dump(data, f, indent=2)
     return filename
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     signal.signal(signal.SIGINT, lambda *_: (print("\n[!] Interrupted."), sys.exit(1)))
