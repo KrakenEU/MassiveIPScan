@@ -17,6 +17,7 @@ MAX_PORT       = 65535
 PER_IP_TIMEOUT = 120
 NMAP_ARGS = (
     "-Pn "
+    "-p- "
     "-T4 "
     "--open "
     "-n "
@@ -56,9 +57,7 @@ def get_range() -> tuple[ipaddress.IPv4Address, ipaddress.IPv4Address]:
             return start, end
 
 
-def split_range(start: ipaddress.IPv4Address,
-                end:   ipaddress.IPv4Address,
-                n:     int) -> list[list[str]]:
+def split_range(start: ipaddress.IPv4Address,end:   ipaddress.IPv4Address,n:     int) -> list[list[str]]:
     total  = int(end) - int(start) + 1
     size   = max(1, total // n)
     chunks = []
@@ -73,14 +72,11 @@ def split_range(start: ipaddress.IPv4Address,
         cur = chunk_end + 1
         if cur > end_i:
             break
-    return [c for c in chunks if c]  # drop empty chunks
+    return [c for c in chunks if c]
 
 # Per-IP scan
 
-def scan_ip_nmap(nm: nmap.PortScanner,
-                 ip: str,
-                 thread_id: int) -> list[int] | None:
-
+def scan_ip_nmap(nm: nmap.PortScanner,ip: str, thread_id: int) -> list[int] | None:
     tprint(thread_id, f"scanning {ip} ...")
 
     error_holder = [None]
@@ -88,7 +84,7 @@ def scan_ip_nmap(nm: nmap.PortScanner,
 
     def do_scan():
         try:
-            nm.scan(hosts=ip, ports=f"1-{MAX_PORT}", arguments=NMAP_ARGS)
+            nm.scan(hosts=ip, arguments=NMAP_ARGS)
         except Exception as e:
             error_holder[0] = e
         finally:
@@ -127,7 +123,6 @@ def scan_ip_nmap(nm: nmap.PortScanner,
 # Worker: scan a chunk of IPs
 
 def scan_chunk(chunk: list[str], thread_id: int) -> list[dict]:
-    """Scan every IP in chunk, return list of reachable host records."""
     nm      = nmap.PortScanner()
     results = []
     total   = len(chunk)
@@ -156,7 +151,6 @@ def build_output(start: ipaddress.IPv4Address,
                  hosts: list[dict],
                  scan_start: datetime,
                  scan_end:   datetime) -> dict:
-    """Build the JSON document structured for Grafana/SNOW ingestion."""
     total_ips = int(end) - int(start) + 1
     return {
         "meta": {
@@ -182,7 +176,6 @@ def save_json(data: dict, start: ipaddress.IPv4Address) -> str:
     with open(filename, "w") as f:
         json.dump(data, f, indent=2)
     return filename
-
 
 def main():
     signal.signal(signal.SIGINT, lambda *_: (print("\n[!] Interrupted."), sys.exit(1)))
