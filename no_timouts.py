@@ -1,16 +1,4 @@
 #!/usr/bin/env python3
-"""
-IP Range Scanner — Grafana/SNOW ingest edition
-Prompts for a start/end IP, splits the range across threads,
-scans all 65535 ports per IP with nmap, records ALL open ports,
-and writes a single structured .json file ready for ingestion.
-
-Requirements:
-    pip install python-nmap
-    nmap must be installed: sudo apt install nmap  /  brew install nmap
-    Recommended: run as root for SYN scan accuracy
-"""
-
 import nmap
 import ipaddress
 import json
